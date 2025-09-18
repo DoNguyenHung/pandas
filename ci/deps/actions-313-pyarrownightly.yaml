@@ -2,7 +2,7 @@ name: pandas-dev
 channels:
   - conda-forge
 dependencies:
-  - python=3.11
+  - python=3.13
 
   # build dependencies
   - versioneer
@@ -14,7 +14,7 @@ dependencies:
   - pytest>=7.3.2
   - pytest-cov
   - pytest-xdist>=3.4.0
-  - hypothesis>=6.84.0
+  - hypothesis>=6.116.0
 
   # required dependencies
   - python-dateutil

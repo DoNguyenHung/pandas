@@ -31,6 +31,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Literal,
+    Self,
     cast,
     overload,
 )
@@ -49,12 +50,16 @@ from pandas._libs import (
 from pandas._libs.hashtable import duplicated
 from pandas._libs.lib import is_range_indexer
 from pandas.compat import PYPY
-from pandas.compat._constants import REF_COUNT
+from pandas.compat._constants import (
+    REF_COUNT,
+    WARNING_CHECK_DISABLED,
+)
 from pandas.compat._optional import import_optional_dependency
 from pandas.compat.numpy import function as nv
 from pandas.errors import (
     ChainedAssignmentError,
     InvalidIndexError,
+    Pandas4Warning,
 )
 from pandas.errors.cow import (
     _chained_assignment_method_msg,
@@ -69,7 +74,6 @@ from pandas.util._decorators import (
 )
 from pandas.util._exceptions import (
     find_stack_level,
-    rewrite_warning,
 )
 from pandas.util._validators import (
     validate_ascending,
@@ -242,7 +246,6 @@ if TYPE_CHECKING:
         ReindexMethod,
         Renamer,
         Scalar,
-        Self,
         SequenceNotStr,
         SortKind,
         StorageOptions,
@@ -726,7 +729,7 @@ class DataFrame(NDFrame, OpsMixin):
                     f"Passing a {type(data).__name__} to {type(self).__name__} "
                     "is deprecated and will raise in a future version. "
                     "Use public APIs instead.",
-                    DeprecationWarning,
+                    Pandas4Warning,
                     stacklevel=2,
                 )
 
@@ -2234,7 +2237,7 @@ class DataFrame(NDFrame, OpsMixin):
 
         if is_iterator(data):
             if nrows == 0:
-                return cls()
+                return cls(index=index, columns=columns)
 
             try:
                 first_row = next(data)
@@ -3720,7 +3723,7 @@ class DataFrame(NDFrame, OpsMixin):
             index_memory_usage = self._constructor_sliced(
                 self.index.memory_usage(deep=deep), index=["Index"]
             )
-            result = index_memory_usage._append(result)
+            result = index_memory_usage._append_internal(result)
         return result
 
     def transpose(
@@ -4296,8 +4299,8 @@ class DataFrame(NDFrame, OpsMixin):
         z  3  50
         # Values for 'a' and 'b' are completely ignored!
         """
-        if not PYPY:
-            if sys.getrefcount(self) <= 3:
+        if not PYPY and not WARNING_CHECK_DISABLED:
+            if sys.getrefcount(self) <= REF_COUNT + 1:
                 warnings.warn(
                     _chained_assignment_msg, ChainedAssignmentError, stacklevel=2
                 )
@@ -5299,6 +5302,13 @@ class DataFrame(NDFrame, OpsMixin):
         referencing an existing Series or sequence:
 
         >>> df.assign(temp_f=df["temp_c"] * 9 / 5 + 32)
+                  temp_c  temp_f
+        Portland    17.0    62.6
+        Berkeley    25.0    77.0
+
+        or by using :meth:`pandas.col`:
+
+        >>> df.assign(temp_f=pd.col("temp_c") * 9 / 5 + 32)
                   temp_c  temp_f
         Portland    17.0    62.6
         Berkeley    25.0    77.0
@@ -9204,7 +9214,7 @@ class DataFrame(NDFrame, OpsMixin):
         1  2  500.0
         2  3    6.0
         """
-        if not PYPY:
+        if not PYPY and not WARNING_CHECK_DISABLED:
             if sys.getrefcount(self) <= REF_COUNT:
                 warnings.warn(
                     _chained_assignment_method_msg,
@@ -9367,6 +9377,9 @@ class DataFrame(NDFrame, OpsMixin):
         )
     )
     @Appender(_shared_docs["groupby"] % _shared_doc_kwargs)
+    @deprecate_nonkeyword_arguments(
+        Pandas4Warning, allowed_args=["self", "by", "level"], name="groupby"
+    )
     def groupby(
         self,
         by=None,
@@ -9886,7 +9899,7 @@ class DataFrame(NDFrame, OpsMixin):
                 "removed in a future version of pandas. See the What's New notes "
                 "for pandas 2.1.0 for details. Do not specify the future_stack "
                 "argument to adopt the new implementation and silence this warning.",
-                FutureWarning,
+                Pandas4Warning,
                 stacklevel=find_stack_level(),
             )
 
@@ -10881,56 +10894,43 @@ class DataFrame(NDFrame, OpsMixin):
     # ----------------------------------------------------------------------
     # Merging / joining methods
 
-    def _append(
+    def _append_internal(
         self,
-        other,
+        other: Series,
         ignore_index: bool = False,
-        verify_integrity: bool = False,
-        sort: bool = False,
     ) -> DataFrame:
-        if isinstance(other, (Series, dict)):
-            if isinstance(other, dict):
-                if not ignore_index:
-                    raise TypeError("Can only append a dict if ignore_index=True")
-                other = Series(other)
-            if other.name is None and not ignore_index:
-                raise TypeError(
-                    "Can only append a Series if ignore_index=True "
-                    "or if the Series has a name"
-                )
+        assert isinstance(other, Series), type(other)
 
-            index = Index(
-                [other.name],
-                name=(
-                    self.index.names
-                    if isinstance(self.index, MultiIndex)
-                    else self.index.name
-                ),
+        if other.name is None and not ignore_index:
+            raise TypeError(
+                "Can only append a Series if ignore_index=True "
+                "or if the Series has a name"
             )
-            row_df = other.to_frame().T
-            # infer_objects is needed for
-            #  test_append_empty_frame_to_series_with_dateutil_tz
-            other = row_df.infer_objects().rename_axis(index.names)
-        elif isinstance(other, list):
-            if not other:
-                pass
-            elif not isinstance(other[0], DataFrame):
-                other = DataFrame(other)
-                if self.index.name is not None and not ignore_index:
-                    other.index.name = self.index.name
+
+        index = Index(
+            [other.name],
+            name=(
+                self.index.names
+                if isinstance(self.index, MultiIndex)
+                else self.index.name
+            ),
+        )
+
+        row_df = other.to_frame().T
+        if isinstance(self.index.dtype, ExtensionDtype):
+            # GH#41626 retain e.g. CategoricalDtype if reached via
+            #  df.loc[key] = item
+            row_df.index = self.index.array._cast_pointwise_result(row_df.index._values)
+
+        # infer_objects is needed for
+        #  test_append_empty_frame_to_series_with_dateutil_tz
+        row_df = row_df.infer_objects().rename_axis(index.names)
 
         from pandas.core.reshape.concat import concat
 
-        if isinstance(other, (list, tuple)):
-            to_concat = [self, *other]
-        else:
-            to_concat = [self, other]
-
         result = concat(
-            to_concat,
+            [self, row_df],
             ignore_index=ignore_index,
-            verify_integrity=verify_integrity,
-            sort=sort,
         )
         return result.__finalize__(self, method="append")
 
@@ -11744,7 +11744,7 @@ class DataFrame(NDFrame, OpsMixin):
             idx_diff = result_index.difference(correl.index)
 
             if len(idx_diff) > 0:
-                correl = correl._append(
+                correl = correl._append_internal(
                     Series([np.nan] * len(idx_diff), index=idx_diff)
                 )
 
@@ -11918,25 +11918,13 @@ class DataFrame(NDFrame, OpsMixin):
                     row_index = np.tile(np.arange(nrows), ncols)
                     col_index = np.repeat(np.arange(ncols), nrows)
                     ser = Series(arr, index=col_index, copy=False)
-                    # GroupBy will raise a warning with SeriesGroupBy as the object,
-                    # likely confusing users
-                    with rewrite_warning(
-                        target_message=(
-                            f"The behavior of SeriesGroupBy.{name} with all-NA values"
-                        ),
-                        target_category=FutureWarning,
-                        new_message=(
-                            f"The behavior of {type(self).__name__}.{name} with all-NA "
-                            "values, or any-NA and skipna=False, is deprecated. In "
-                            "a future version this will raise ValueError"
-                        ),
-                    ):
-                        result = ser.groupby(row_index).agg(name, **kwds)
+                    if name == "all":
+                        # Behavior here appears incorrect; preserving
+                        # for backwards compatibility for now.
+                        # See https://github.com/pandas-dev/pandas/issues/57171
+                        skipna = True
+                    result = ser.groupby(row_index).agg(name, **kwds, skipna=skipna)
                     result.index = df.index
-                    if not skipna and name not in ("any", "all"):
-                        mask = df.isna().to_numpy(dtype=np.bool_).any(axis=1)
-                        other = -1 if name in ("idxmax", "idxmin") else lib.no_default
-                        result = result.mask(mask, other)
                     return result
 
             df = df.T
@@ -12061,7 +12049,7 @@ class DataFrame(NDFrame, OpsMixin):
         **kwargs,
     ) -> Series | bool: ...
 
-    @deprecate_nonkeyword_arguments(version="4.0", allowed_args=["self"], name="all")
+    @deprecate_nonkeyword_arguments(Pandas4Warning, allowed_args=["self"], name="all")
     @doc(make_doc("all", ndim=1))
     def all(
         self,
@@ -12108,7 +12096,7 @@ class DataFrame(NDFrame, OpsMixin):
         **kwargs,
     ) -> Series | Any: ...
 
-    @deprecate_nonkeyword_arguments(version="4.0", allowed_args=["self"], name="min")
+    @deprecate_nonkeyword_arguments(Pandas4Warning, allowed_args=["self"], name="min")
     @doc(make_doc("min", ndim=2))
     def min(
         self,
@@ -12155,7 +12143,7 @@ class DataFrame(NDFrame, OpsMixin):
         **kwargs,
     ) -> Series | Any: ...
 
-    @deprecate_nonkeyword_arguments(version="4.0", allowed_args=["self"], name="max")
+    @deprecate_nonkeyword_arguments(Pandas4Warning, allowed_args=["self"], name="max")
     @doc(make_doc("max", ndim=2))
     def max(
         self,
@@ -12171,7 +12159,7 @@ class DataFrame(NDFrame, OpsMixin):
             result = result.__finalize__(self, method="max")
         return result
 
-    @deprecate_nonkeyword_arguments(version="4.0", allowed_args=["self"], name="sum")
+    @deprecate_nonkeyword_arguments(Pandas4Warning, allowed_args=["self"], name="sum")
     def sum(
         self,
         axis: Axis | None = 0,
@@ -12272,7 +12260,7 @@ class DataFrame(NDFrame, OpsMixin):
             result = result.__finalize__(self, method="sum")
         return result
 
-    @deprecate_nonkeyword_arguments(version="4.0", allowed_args=["self"], name="prod")
+    @deprecate_nonkeyword_arguments(Pandas4Warning, allowed_args=["self"], name="prod")
     def prod(
         self,
         axis: Axis | None = 0,
@@ -12390,7 +12378,7 @@ class DataFrame(NDFrame, OpsMixin):
         **kwargs,
     ) -> Series | Any: ...
 
-    @deprecate_nonkeyword_arguments(version="4.0", allowed_args=["self"], name="mean")
+    @deprecate_nonkeyword_arguments(Pandas4Warning, allowed_args=["self"], name="mean")
     @doc(make_doc("mean", ndim=2))
     def mean(
         self,
@@ -12437,7 +12425,9 @@ class DataFrame(NDFrame, OpsMixin):
         **kwargs,
     ) -> Series | Any: ...
 
-    @deprecate_nonkeyword_arguments(version="4.0", allowed_args=["self"], name="median")
+    @deprecate_nonkeyword_arguments(
+        Pandas4Warning, allowed_args=["self"], name="median"
+    )
     @doc(make_doc("median", ndim=2))
     def median(
         self,
@@ -12487,7 +12477,7 @@ class DataFrame(NDFrame, OpsMixin):
         **kwargs,
     ) -> Series | Any: ...
 
-    @deprecate_nonkeyword_arguments(version="4.0", allowed_args=["self"], name="sem")
+    @deprecate_nonkeyword_arguments(Pandas4Warning, allowed_args=["self"], name="sem")
     def sem(
         self,
         axis: Axis | None = 0,
@@ -12607,7 +12597,7 @@ class DataFrame(NDFrame, OpsMixin):
         **kwargs,
     ) -> Series | Any: ...
 
-    @deprecate_nonkeyword_arguments(version="4.0", allowed_args=["self"], name="var")
+    @deprecate_nonkeyword_arguments(Pandas4Warning, allowed_args=["self"], name="var")
     def var(
         self,
         axis: Axis | None = 0,
@@ -12726,7 +12716,7 @@ class DataFrame(NDFrame, OpsMixin):
         **kwargs,
     ) -> Series | Any: ...
 
-    @deprecate_nonkeyword_arguments(version="4.0", allowed_args=["self"], name="std")
+    @deprecate_nonkeyword_arguments(Pandas4Warning, allowed_args=["self"], name="std")
     def std(
         self,
         axis: Axis | None = 0,
@@ -12849,7 +12839,7 @@ class DataFrame(NDFrame, OpsMixin):
         **kwargs,
     ) -> Series | Any: ...
 
-    @deprecate_nonkeyword_arguments(version="4.0", allowed_args=["self"], name="skew")
+    @deprecate_nonkeyword_arguments(Pandas4Warning, allowed_args=["self"], name="skew")
     def skew(
         self,
         axis: Axis | None = 0,
@@ -12969,7 +12959,7 @@ class DataFrame(NDFrame, OpsMixin):
         **kwargs,
     ) -> Series | Any: ...
 
-    @deprecate_nonkeyword_arguments(version="4.0", allowed_args=["self"], name="kurt")
+    @deprecate_nonkeyword_arguments(Pandas4Warning, allowed_args=["self"], name="kurt")
     def kurt(
         self,
         axis: Axis | None = 0,
@@ -13248,13 +13238,11 @@ class DataFrame(NDFrame, OpsMixin):
         # indices will always be np.ndarray since axis is not N
 
         if (indices == -1).any():
-            warnings.warn(
-                f"The behavior of {type(self).__name__}.idxmin with all-NA "
-                "values, or any-NA and skipna=False, is deprecated. In a future "
-                "version this will raise ValueError",
-                FutureWarning,
-                stacklevel=find_stack_level(),
-            )
+            if skipna:
+                msg = "Encountered all NA values"
+            else:
+                msg = "Encountered an NA values with skipna=False"
+            raise ValueError(msg)
 
         index = data._get_axis(axis)
         result = algorithms.take(
@@ -13355,13 +13343,11 @@ class DataFrame(NDFrame, OpsMixin):
         # indices will always be 1d array since axis is not None
 
         if (indices == -1).any():
-            warnings.warn(
-                f"The behavior of {type(self).__name__}.idxmax with all-NA "
-                "values, or any-NA and skipna=False, is deprecated. In a future "
-                "version this will raise ValueError",
-                FutureWarning,
-                stacklevel=find_stack_level(),
-            )
+            if skipna:
+                msg = "Encountered all NA values"
+            else:
+                msg = "Encountered an NA values with skipna=False"
+            raise ValueError(msg)
 
         index = data._get_axis(axis)
         result = algorithms.take(
